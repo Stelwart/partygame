@@ -4,7 +4,8 @@ const roleScreen = document.getElementById('roleScreen'), hostLobby = document.g
 const turnScreen = document.getElementById('turnScreen'), lastPlayerScreen = document.getElementById('lastPlayerScreen'), endScreen = document.getElementById('endScreen');
 const cropModal = document.getElementById('cropModal'), cropCvs = document.getElementById('cropCanvas'), cropCtx = cropCvs.getContext('2d'), zoomSlider = document.getElementById('zoomSlider');
 
-let peer = null, hostConn = null, isHost = false, myPlayerId = '';
+const BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
+let client = null, roomCode = '', isHost = false, myPlayerId = 'p_' + Math.random().toString(36).slice(2, 9);
 let players = [], curIdx = 0, isRun = false, mouseMode = false, mouseDown = false;
 let audioCtx, analyser, buf, score = 0, bestScore = 0, timeLeft = 30, lastT = 0, targets = [], finishX = 0, flashRed = 0, lastSyncT = 0;
 let myAvatarSrc = '', imgCache = {};
@@ -24,7 +25,7 @@ function getCachedImg(src) {
 }
 
 document.getElementById('phoneFileInp').onchange = e => {
-  const file = e.target.files[0];
+  const file = e.target.files;
   if (!file) return;
   const reader = new FileReader();
   reader.onload = ev => {
@@ -69,44 +70,32 @@ zoomSlider.oninput = () => {
 
 document.getElementById('cancelCropBtn').onclick = () => { cropModal.style.display = 'none'; };
 document.getElementById('saveCropBtn').onclick = () => {
-  const out = document.createElement('canvas'); out.width = 120; out.height = 120;
+  const out = document.createElement('canvas'); out.width = 100; out.height = 100;
   out.getContext('2d').drawImage(cropState.img, cropState.x - 30, cropState.y - 30, cropState.img.width * cropState.scale, cropState.img.height * cropState.scale);
-  myAvatarSrc = out.toDataURL('image/jpeg', 0.75);
+  myAvatarSrc = out.toDataURL('image/jpeg', 0.65);
   const prev = document.getElementById('previewAva'); prev.src = myAvatarSrc; prev.style.display = 'inline-block';
   document.getElementById('photoText').textContent = 'Фото выбрано!';
   cropModal.style.display = 'none';
 };
 
+// --- ХОСТ (ТВ / ПК) ---
 document.getElementById('createRoomBtn').onclick = () => {
   const btn = document.getElementById('createRoomBtn');
-  if (typeof Peer === 'undefined') {
-    alert('Файл peerjs.min.js не найден в папке с игрой!');
-    return;
-  }
-  btn.disabled = true;
-  btn.textContent = 'Создание комнаты...';
+  if (typeof mqtt === 'undefined') { alert('Файл mqtt.min.js не найден!'); return; }
+  btn.disabled = true; btn.textContent = 'Подключение...';
   isHost = true;
-  const code = Math.floor(1000 + Math.random() * 9000).toString();
-  peer = new Peer('notegame-' + code);
+  roomCode = Math.floor(1000 + Math.random() * 9000).toString();
+  client = mqtt.connect(BROKER_URL);
 
-  peer.on('open', () => {
+  client.on('connect', () => {
+    client.subscribe('notegame/' + roomCode + '/to_host');
     roleScreen.style.display = 'none';
     hostLobby.style.display = 'flex';
-    document.getElementById('roomCodeDisplay').textContent = code;
+    document.getElementById('roomCodeDisplay').textContent = roomCode;
   });
 
-  peer.on('error', err => {
-    btn.disabled = false;
-    btn.textContent = 'Создать комнату (ПК / ТВ)';
-    alert('Ошибка сети: ' + err.type + '. Попробуйте ещё раз.');
-  });
-
-  peer.on('connection', conn => {
-    conn.on('data', data => handleHostData(conn, data));
-    conn.on('close', () => {
-      players = players.filter(p => p.id !== conn.peer);
-      updateHostLobby();
-    });
+  client.on('message', (topic, message) => {
+    try { handleHostData(JSON.parse(message.toString())); } catch (e) {}
   });
 };
 
@@ -124,7 +113,15 @@ function updateHostLobby() {
 }
 
 function broadcastToPhones(msg) {
-  players.forEach(p => { if (p.conn && p.conn.open) p.conn.send(msg); });
+  if (client && client.connected) {
+    client.publish('notegame/' + roomCode + '/to_phones', JSON.stringify(msg));
+  }
+}
+
+function sendToHost(msg) {
+  if (client && client.connected) {
+    client.publish('notegame/' + roomCode + '/to_host', JSON.stringify({ senderId: myPlayerId, ...msg }));
+  }
 }
 
 document.getElementById('hostStartBtn').onclick = () => {
@@ -133,11 +130,11 @@ document.getElementById('hostStartBtn').onclick = () => {
 
 function startTurnFlow(prevText) {
   const cur = players[curIdx];
-  const cleanPlayers = players.map(p => ({ id: p.id, name: p.name, hasCustomName: p.hasCustomName, src: p.src, score: p.score }));
   showTurnUI(cur, curIdx, prevText, false);
-  broadcastToPhones({ type: 'TURN_WAIT', curIdx, players: cleanPlayers, prevText });
+  broadcastToPhones({ type: 'TURN_WAIT', curIdx, players, prevText });
 }
 
+// --- СМАРТФОН ИГРОКА ---
 document.getElementById('joinScreenBtn').onclick = () => { roleScreen.style.display = 'none'; joinScreen.style.display = 'flex'; };
 document.getElementById('backRoleBtn').onclick = () => { joinScreen.style.display = 'none'; roleScreen.style.display = 'flex'; };
 
@@ -145,18 +142,19 @@ document.getElementById('connectBtn').onclick = () => {
   const code = document.getElementById('codeInput').value.trim();
   const rawName = document.getElementById('nameInput').value.trim();
   if (code.length !== 4) { alert('Введите 4-значный код комнаты!'); return; }
+  roomCode = code;
   document.getElementById('joinStatus').textContent = 'Подключение...';
-  peer = new Peer();
-  peer.on('open', id => {
-    myPlayerId = id;
-    hostConn = peer.connect('notegame-' + code);
-    hostConn.on('open', () => {
-      hostConn.send({ type: 'JOIN', name: rawName, hasCustomName: rawName.length > 0, src: myAvatarSrc });
-      document.getElementById('joinStatus').textContent = 'Вы в комнате! Ожидайте старта игры...';
-      document.getElementById('connectBtn').disabled = true;
-    });
-    hostConn.on('data', data => handlePhoneData(data));
-    hostConn.on('error', () => { document.getElementById('joinStatus').textContent = 'Комната не найдена!'; });
+  client = mqtt.connect(BROKER_URL);
+
+  client.on('connect', () => {
+    client.subscribe('notegame/' + roomCode + '/to_phones');
+    sendToHost({ type: 'JOIN', name: rawName, hasCustomName: rawName.length > 0, src: myAvatarSrc });
+    document.getElementById('joinStatus').textContent = 'Вы в комнате! Ожидайте старта игры...';
+    document.getElementById('connectBtn').disabled = true;
+  });
+
+  client.on('message', (topic, message) => {
+    try { handlePhoneData(JSON.parse(message.toString())); } catch (e) {}
   });
 };
 function formatPlayerLabel(p) {
@@ -188,12 +186,15 @@ function showTurnUI(cur, idx, prevText, isMyPhone) {
   }
 }
 
-function handleHostData(conn, data) {
+function handleHostData(data) {
   if (data.type === 'JOIN') {
-    if (players.length >= 8) { conn.send({ type: 'FULL' }); return; }
+    if (players.some(p => p.id === data.senderId)) return;
+    if (players.length >= 8) {
+      broadcastToPhones({ type: 'FULL', targetId: data.senderId });
+      return;
+    }
     players.push({
-      id: conn.peer,
-      conn,
+      id: data.senderId,
       name: data.name || ('Игрок ' + (players.length + 1)),
       hasCustomName: data.hasCustomName,
       src: data.src || '',
@@ -220,14 +221,13 @@ function handleHostData(conn, data) {
       curIdx++;
       startTurnFlow(statusMsg);
     } else {
-      const cleanPlayers = players.map(p => ({ name: p.name, src: p.src, score: p.score }));
       showLastPlayerUI(players[curIdx], statusMsg);
-      broadcastToPhones({ type: 'LAST_PLAYER', finished: cleanPlayers[curIdx], statusMsg, players: cleanPlayers });
+      broadcastToPhones({ type: 'LAST_PLAYER', finished: players[curIdx], statusMsg, players });
     }
   } else if (data.type === 'SHOW_BOARD') {
     lastPlayerScreen.style.display = 'none';
     showLeaderboard(players);
-    broadcastToPhones({ type: 'BOARD', players: players.map(p => ({ name: p.name, src: p.src, score: p.score })) });
+    broadcastToPhones({ type: 'BOARD', players });
   } else if (data.type === 'BACK_MENU') {
     endScreen.style.display = 'none';
     hostLobby.style.display = 'flex';
@@ -237,7 +237,7 @@ function handleHostData(conn, data) {
 }
 
 function handlePhoneData(data) {
-  if (data.type === 'FULL') {
+  if (data.type === 'FULL' && data.targetId === myPlayerId) {
     document.getElementById('joinStatus').textContent = 'Комната заполнена (максимум 8 игроков)!';
   } else if (data.type === 'TURN_WAIT') {
     players = data.players;
@@ -267,9 +267,9 @@ document.getElementById('toLeaderboardBtn').onclick = () => {
   if (isHost) {
     lastPlayerScreen.style.display = 'none';
     showLeaderboard(players);
-    broadcastToPhones({ type: 'BOARD', players: players.map(p => ({ name: p.name, src: p.src, score: p.score })) });
-  } else if (hostConn) {
-    hostConn.send({ type: 'SHOW_BOARD' });
+    broadcastToPhones({ type: 'BOARD', players });
+  } else {
+    sendToHost({ type: 'SHOW_BOARD' });
   }
 };
 
@@ -303,8 +303,8 @@ document.getElementById('menuBtn').onclick = () => {
     hostLobby.style.display = 'flex';
     players.forEach(p => p.score = 0);
     broadcastToPhones({ type: 'RESET_LOBBY' });
-  } else if (hostConn) {
-    hostConn.send({ type: 'BACK_MENU' });
+  } else {
+    sendToHost({ type: 'BACK_MENU' });
   }
 };
 function resetAttempt() {
@@ -346,7 +346,7 @@ function respawnAtNextNote() {
 function beginPhoneRound() {
   timeLeft = 30; bestScore = 0; resetAttempt();
   uiBar.style.display = 'block'; turnScreen.style.display = 'none';
-  if (hostConn) hostConn.send({ type: 'ROUND_START' });
+  sendToHost({ type: 'ROUND_START' });
   lastT = performance.now(); isRun = true; requestAnimationFrame(loop);
 }
 
@@ -423,7 +423,7 @@ function endPhoneTurn(statusType) {
   if (score > bestScore) bestScore = score;
   const finalPts = Math.round(bestScore);
   ctx.clearRect(0, 0, 800, 450);
-  if (hostConn) hostConn.send({ type: 'TURN_END', statusType, finalPts });
+  sendToHost({ type: 'TURN_END', statusType, finalPts });
 }
 
 function loop(now) {
@@ -455,9 +455,9 @@ function loop(now) {
   if (player.x >= finishX) { score += 500; endPhoneTurn('finish'); return; }
 
   renderScene(player, targets, finishX, flashRed, myAvatarSrc);
-  if (hostConn && hostConn.open && now - lastSyncT > 33) {
+  if (now - lastSyncT > 40) {
     lastSyncT = now;
-    hostConn.send({ type: 'STATE', player, targets, finishX, flashRed, timeLeft, score });
+    sendToHost({ type: 'STATE', player, targets, finishX, flashRed, timeLeft, score });
   }
   requestAnimationFrame(loop);
 }
