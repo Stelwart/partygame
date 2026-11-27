@@ -131,7 +131,13 @@ document.getElementById('hostStartBtn').onclick = () => {
 function startTurnFlow(prevText) {
   const cur = players[curIdx];
   showTurnUI(cur, curIdx, prevText, false);
-  broadcastToPhones({ type: 'TURN_WAIT', curIdx, players, prevText });
+  const lightPlayers = players.map(p => ({
+    id: p.id,
+    name: p.name,
+    hasCustomName: p.hasCustomName,
+    score: p.score
+  }));
+  broadcastToPhones({ type: 'TURN_WAIT', curIdx, players: lightPlayers, prevText });
 }
 
 // --- СМАРТФОН ИГРОКА ---
@@ -143,20 +149,30 @@ document.getElementById('connectBtn').onclick = () => {
   const rawName = document.getElementById('nameInput').value.trim();
   if (code.length !== 4) { alert('Введите 4-значный код комнаты!'); return; }
   roomCode = code;
+  const btn = document.getElementById('connectBtn');
+  btn.disabled = true;
   document.getElementById('joinStatus').textContent = 'Подключение...';
-  client = mqtt.connect(BROKER_URL);
+
+  client = mqtt.connect(BROKER_URL, { clientId: 'phone_' + myPlayerId });
 
   client.on('connect', () => {
-    client.subscribe('notegame/' + roomCode + '/to_phones');
-    sendToHost({ type: 'JOIN', name: rawName, hasCustomName: rawName.length > 0, src: myAvatarSrc });
-    document.getElementById('joinStatus').textContent = 'Вы в комнате! Ожидайте старта игры...';
-    document.getElementById('connectBtn').disabled = true;
+    client.subscribe('notegame/' + roomCode + '/to_phones', (err) => {
+      if (!err) {
+        sendToHost({ type: 'JOIN', name: rawName, hasCustomName: rawName.length > 0, src: myAvatarSrc });
+        document.getElementById('joinStatus').textContent = 'Вы в комнате! Ожидайте старта игры на экране ноутбука...';
+      }
+    });
   });
 
   client.on('message', (topic, message) => {
-    try { handlePhoneData(JSON.parse(message.toString())); } catch (e) {}
+    try {
+      const data = JSON.parse(message.toString());
+      handlePhoneData(data);
+    } catch (e) {}
   });
 };
+
+
 function formatPlayerLabel(p) {
   return p.hasCustomName ? ('Игрок ' + p.name) : p.name;
 }
